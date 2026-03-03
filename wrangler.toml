@@ -1,8 +1,0 @@
-name = "isic-sql-explorer"
-main = "worker.js"
-compatibility_date = "2025-01-01"
-
-[assets]
-directory = "./public"
-binding = "ASSETS"
-run_worker_first = ["/*.parquet"]

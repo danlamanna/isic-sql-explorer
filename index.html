@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html data-theme="winter">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ISIC Data Explorer</title>
+
+    <link rel="preconnect" href="https://fonts.gstatic.com">
+    <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@200;300;400;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.14/dist/full.min.css" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            fontFamily: { sans: ['Nunito', 'sans-serif'] }
+          }
+        }
+      }
+    </script>
+
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+    <script type="module">
+      import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
+      window.duckdb = duckdb;
+      window.dispatchEvent(new Event('duckdb-ready'));
+    </script>
+    <script type="module">
+      import {EditorView, basicSetup} from 'https://esm.sh/codemirror@6.0.1';
+      import {sql, PostgreSQL} from 'https://esm.sh/@codemirror/lang-sql@6';
+      window.cmModules = {EditorView, basicSetup, sql, PostgreSQL};
+      window.dispatchEvent(new Event('codemirror-ready'));
+    </script>
+  </head>
+
+  <body>
+    <div class="container max-w-7xl mx-auto p-8" x-data="dataExplorer()">
+      <h1 class="text-2xl font-bold mb-2">ISIC Data Explorer</h1>
+      <p class="mb-6 text-gray-600">
+        Query the public
+        <a href="https://www.isic-archive.com" class="link link-primary" target="_blank" rel="noopener">ISIC Archive</a>
+        metadata using
+        <a href="https://duckdb.org/docs/sql/introduction" class="link link-primary" target="_blank" rel="noopener">SQL</a>.
+        Data is loaded as a Parquet file and queried entirely in your browser.
+      </p>
+      <div x-show="totalImages !== null" class="mb-6">
+        <span class="badge badge-lg font-semibold" x-text="Number(totalImages).toLocaleString() + ' images available'"></span>
+      </div>
+
+      <div class="mb-2">
+        <label class="label font-semibold">SQL Query</label>
+        <div id="sql-editor" class="border border-gray-300 rounded overflow-hidden"></div>
+      </div>
+
+      <div class="flex items-center gap-4 mb-4">
+        <button
+          @click="runQuery()"
+          :disabled="!ready || running"
+          class="btn btn-primary btn-sm"
+        >
+          <span x-show="!running">Run Query</span>
+          <span x-show="running">Running...</span>
+        </button>
+        <button
+          @click="setQuery('DESCRIBE metadata'); runQuery()"
+          :disabled="!ready || running"
+          class="btn btn-outline btn-sm"
+        >
+          View Table Schema
+        </button>
+        <button
+          @click="copyLink()"
+          class="btn btn-ghost btn-sm"
+        >
+          <span x-text="copyLabel">Copy Link</span>
+        </button>
+        <span x-show="elapsed" class="text-sm text-gray-500" x-text="elapsed"></span>
+      </div>
+
+      <div x-show="!ready" class="mb-4">
+        <div class="alert">
+          <span class="loading loading-spinner loading-sm"></span>
+          <span x-text="status"></span>
+        </div>
+      </div>
+
+      <div x-show="error" class="mb-4">
+        <div class="alert alert-error">
+          <pre class="whitespace-pre-wrap text-sm" x-text="error"></pre>
+        </div>
+      </div>
+
+      <details class="mb-6 bg-base-200 rounded-lg p-2">
+        <summary class="cursor-pointer font-semibold text-sm p-2">Example Queries</summary>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 p-2">
+          <template x-for="example in examples" :key="example.name">
+            <button
+              class="btn btn-ghost btn-sm justify-start text-left h-auto py-2 normal-case"
+              @click="setQuery(example.sql)"
+            >
+              <span class="font-semibold" x-text="example.name"></span>
+            </button>
+          </template>
+        </div>
+      </details>
+
+      <div x-show="columns.length > 0" class="overflow-x-auto">
+        <div class="text-sm text-gray-500 mb-2" x-text="rowCount + ' rows returned'"></div>
+        <div x-show="truncated" class="alert alert-warning mb-2 text-sm py-2">
+          <span>Results limited to <span x-text="rows.length"></span> rows. Add a LIMIT clause to your query to control the result size.</span>
+        </div>
+        <table class="table table-xs table-zebra w-full">
+          <thead>
+            <tr>
+              <template x-for="col in columns" :key="col">
+                <th class="text-xs font-bold" x-text="col"></th>
+              </template>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="(row, i) in rows" :key="i">
+              <tr>
+                <template x-for="col in columns" :key="col">
+                  <td class="text-sm font-mono" x-text="row[col] !== null && row[col] !== undefined ? row[col] : ''"></td>
+                </template>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+      // Configure the Parquet file URL here, or pass it as a ?parquet=<url> query parameter.
+      const DEFAULT_PARQUET_URL = 'https://isic-challenge-data.s3.us-east-1.amazonaws.com/metadata.parquet';
+      const MAX_DISPLAY_ROWS = 1000;
+
+      function getParquetUrl() {
+        const params = new URLSearchParams(window.location.search);
+        const url = params.get('parquet') || DEFAULT_PARQUET_URL;
+        return new URL(url, window.location.href).href;
+      }
+
+      function getQueryFromUrl() {
+        const params = new URLSearchParams(window.location.search);
+        const q = params.get('q');
+        return q || null;
+      }
+
+      function updateUrlWithQuery(query) {
+        const params = new URLSearchParams(window.location.search);
+        params.set('q', query);
+        const newUrl = window.location.pathname + '?' + params.toString();
+        window.history.replaceState(null, '', newUrl);
+      }
+
+      function dataExplorer() {
+        const defaultQuery = 'SELECT\n  diagnosis_1,\n  COUNT(*) AS count\nFROM metadata\nGROUP BY diagnosis_1\nORDER BY count DESC';
+        const initialQuery = getQueryFromUrl() || defaultQuery;
+
+        return {
+          db: null,
+          conn: null,
+          editor: null,
+          ready: false,
+          running: false,
+          status: 'Initializing...',
+          columns: [],
+          rows: [],
+          totalImages: null,
+          rowCount: 0,
+          truncated: false,
+          error: '',
+          elapsed: '',
+          copyLabel: 'Copy Link',
+          examples: [
+            {
+              name: 'Look up images by ISIC ID',
+              sql: 'SELECT\n  isic_id,\n  diagnosis_1,\n  age_approx,\n  sex,\n  anatom_site_general\nFROM metadata\nWHERE isic_id IN (\'ISIC_0000000\', \'ISIC_0000001\', \'ISIC_0000002\')'
+            },
+            {
+              name: 'Diagnosis overview',
+              sql: 'SELECT\n  diagnosis_1,\n  COUNT(*) AS count\nFROM metadata\nGROUP BY diagnosis_1\nORDER BY count DESC'
+            },
+            {
+              name: 'Demographics by sex',
+              sql: 'SELECT\n  sex,\n  ROUND(AVG(age_approx), 1) AS avg_age,\n  COUNT(*) AS count\nFROM metadata\nWHERE sex IS NOT NULL\nGROUP BY sex'
+            },
+            {
+              name: 'Diagnosis by anatomic site',
+              sql: 'SELECT\n  anatom_site_general,\n  diagnosis_1,\n  COUNT(*) AS count\nFROM metadata\nWHERE anatom_site_general IS NOT NULL\n  AND diagnosis_1 IS NOT NULL\nGROUP BY 1, 2\nORDER BY 1, count DESC'
+            },
+            {
+              name: 'Melanoma thickness distribution',
+              sql: 'SELECT\n  mel_thick_mm,\n  COUNT(*) AS count\nFROM metadata\nWHERE mel_thick_mm IS NOT NULL\nGROUP BY mel_thick_mm\nORDER BY mel_thick_mm'
+            },
+            {
+              name: 'Image type breakdown',
+              sql: 'SELECT\n  image_type,\n  COUNT(*) AS count\nFROM metadata\nWHERE image_type IS NOT NULL\nGROUP BY image_type\nORDER BY count DESC'
+            },
+            {
+              name: 'Fitzpatrick skin type distribution',
+              sql: 'SELECT\n  fitzpatrick_skin_type,\n  COUNT(*) AS count\nFROM metadata\nWHERE fitzpatrick_skin_type IS NOT NULL\nGROUP BY fitzpatrick_skin_type\nORDER BY fitzpatrick_skin_type'
+            },
+            {
+              name: 'Top 3 diagnoses per anatomic site with demographics',
+              sql: 'WITH site_diagnosis AS (\n  SELECT\n    anatom_site_general,\n    diagnosis_1,\n    COUNT(*) AS count,\n    ROUND(AVG(age_approx), 1) AS avg_age,\n    ROUND(100.0 * COUNT(*) FILTER (WHERE sex = \'male\') / COUNT(*), 1) AS pct_male,\n    ROW_NUMBER() OVER (\n      PARTITION BY anatom_site_general\n      ORDER BY COUNT(*) DESC\n    ) AS rank\n  FROM metadata\n  WHERE anatom_site_general IS NOT NULL\n    AND diagnosis_1 IS NOT NULL\n  GROUP BY 1, 2\n),\nsite_totals AS (\n  SELECT\n    anatom_site_general,\n    SUM(count) AS total\n  FROM site_diagnosis\n  GROUP BY 1\n)\nSELECT\n  sd.anatom_site_general AS site,\n  sd.diagnosis_1 AS diagnosis,\n  sd.count,\n  ROUND(100.0 * sd.count / st.total, 1) AS pct_of_site,\n  sd.avg_age,\n  sd.pct_male\nFROM site_diagnosis sd\nJOIN site_totals st USING (anatom_site_general)\nWHERE sd.rank <= 3\nORDER BY st.total DESC, sd.rank'
+            }
+          ],
+
+          getQuery() {
+            return this.editor ? this.editor.state.doc.toString() : defaultQuery;
+          },
+
+          setQuery(text) {
+            if (!this.editor) return;
+            this.editor.dispatch({
+              changes: {from: 0, to: this.editor.state.doc.length, insert: text}
+            });
+          },
+
+          async copyLink() {
+            updateUrlWithQuery(this.getQuery());
+            await navigator.clipboard.writeText(window.location.href);
+            this.copyLabel = 'Copied!';
+            setTimeout(() => { this.copyLabel = 'Copy Link'; }, 2000);
+          },
+
+          initEditor() {
+            const setupEditor = () => {
+              const {EditorView, basicSetup, sql, PostgreSQL} = window.cmModules;
+              this.editor = new EditorView({
+                doc: initialQuery,
+                extensions: [
+                  basicSetup,
+                  sql({dialect: PostgreSQL}),
+                  EditorView.theme({
+                    '&': {fontSize: '14px'},
+                    '.cm-content': {fontFamily: 'monospace'},
+                  }),
+                ],
+                parent: document.getElementById('sql-editor'),
+              });
+            };
+
+            if (window.cmModules) {
+              setupEditor();
+            } else {
+              window.addEventListener('codemirror-ready', () => setupEditor());
+            }
+          },
+
+          init() {
+            this.initEditor();
+
+            const initDuckDB = async () => {
+              try {
+                this.status = 'Initializing DuckDB...';
+                const DUCKDB_CONFIG = await duckdb.selectBundle({
+                  mvp: {
+                    mainModule: 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-mvp.wasm',
+                    mainWorker: 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser-mvp.worker.js',
+                  },
+                  eh: {
+                    mainModule: 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-eh.wasm',
+                    mainWorker: 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser-eh.worker.js',
+                  },
+                });
+                const logger = new duckdb.ConsoleLogger();
+                const workerResponse = await fetch(DUCKDB_CONFIG.mainWorker);
+                const workerBlob = new Blob([await workerResponse.text()], {type: 'application/javascript'});
+                const workerUrl = URL.createObjectURL(workerBlob);
+                const worker = new Worker(workerUrl);
+                this.db = new duckdb.AsyncDuckDB(logger, worker);
+                await this.db.instantiate(DUCKDB_CONFIG.mainModule);
+                this.conn = await this.db.connect();
+
+                const parquetUrl = getParquetUrl();
+                await this.conn.query(`
+                  CREATE VIEW metadata AS SELECT * FROM read_parquet('${parquetUrl}')
+                `);
+
+                const countResult = await this.conn.query('SELECT COUNT(*) AS n FROM metadata');
+                this.totalImages = countResult.toArray()[0].n;
+                this.ready = true;
+                if (getQueryFromUrl()) this.runQuery();
+              } catch (e) {
+                this.error = 'Failed to initialize: ' + e.message;
+              }
+            };
+
+            if (window.duckdb) {
+              initDuckDB();
+            } else {
+              window.addEventListener('duckdb-ready', () => initDuckDB());
+            }
+          },
+
+          async runQuery() {
+            if (!this.ready || this.running) return;
+
+            this.error = '';
+            this.columns = [];
+            this.rows = [];
+            this.elapsed = '';
+            this.running = true;
+
+            const queryText = this.getQuery();
+            updateUrlWithQuery(queryText);
+
+            const limitedQuery = `SELECT * FROM (${queryText}) sub LIMIT ${MAX_DISPLAY_ROWS + 1}`;
+
+            const start = performance.now();
+            try {
+              const result = await this.conn.query(limitedQuery);
+              const elapsedMs = performance.now() - start;
+
+              this.columns = result.schema.fields.map(f => f.name);
+              const allRows = result.toArray();
+              this.truncated = allRows.length > MAX_DISPLAY_ROWS;
+              const displayRows = this.truncated ? allRows.slice(0, MAX_DISPLAY_ROWS) : allRows;
+              this.rowCount = displayRows.length;
+              this.rows = displayRows.map(row => {
+                const obj = {};
+                for (const col of this.columns) {
+                  obj[col] = row[col];
+                }
+                return obj;
+              });
+              this.elapsed = `${(elapsedMs / 1000).toFixed(2)}s | ${this.truncated ? MAX_DISPLAY_ROWS + '+' : this.rowCount} rows`;
+            } catch (e) {
+              this.error = e.message;
+              this.elapsed = '';
+            } finally {
+              this.running = false;
+            }
+          }
+        }
+      }
+    </script>
+  </body>
+</html>
